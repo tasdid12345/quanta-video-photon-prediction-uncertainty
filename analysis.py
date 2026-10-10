@@ -1,5 +1,5 @@
 """Self-supervised photon prediction on simulated quanta videos: bit2bit-style baseline vs
-a small U-Net 3D-CNN ensemble with temperature scaling. Pure numpy (hand-written 3D CNN)."""
+a small light-level-conditioned U-Net 3D-CNN ensemble with temperature scaling. Pure numpy (hand-written 3D CNN)."""
 import io, json, os, sys, time
 import numpy as np, requests
 from numpy.lib.stride_tricks import sliding_window_view as swv
@@ -11,10 +11,13 @@ from scipy.stats import spearmanr
 URL = "https://storage.googleapis.com/tensorflow/tf-keras-datasets/mnist.npz"
 LEVELS, T_LEN, K, NM, EPS = [0.05, 0.2, 1.0], 16, 4, 3, 0.05
 NTR, NVA, NTE = 240, 30, 80
-BASE_CAP, ENS_CAP, MAX_STEPS = 45, 100, 1500  # seconds per model / step upper bound
+BASE_CAP, ENS_CAP, MAX_STEPS = 45, 120, 1500  # seconds per model / step upper bound
 np.random.seed(42)
 T0 = time.time()
 def say(*a): print(f"[{time.time()-T0:6.0f}s]", *a, flush=True)
+
+def lvc(lv):  # known light level encoded as a constant conditioning channel (log scale, roughly in [-1, 1])
+    return float((np.log(lv) - np.log(0.2)) / 1.5)
 
 # ---------------- tiny autodiff for 3D CNNs ----------------
 TAPE, TRACK = [], True
@@ -55,7 +58,7 @@ def cat(a, b):
     return Nd(np.concatenate([a.v, b.v], 1), (a, b), lambda g: (g[:, :c], g[:, c:]))
 
 BASE_SH = [(8, 2), (8, 8), (1, 8)]
-UNET_SH = [(8, 2), (12, 8), (16, 12), (12, 28), (8, 20), (1, 8)]
+UNET_SH = [(8, 3), (12, 8), (16, 12), (12, 28), (8, 20), (1, 8)]  # U-Net input: bits, mask, light-level channel
 def fwd_base(P, x):
     h = relu(conv(x, P[0], P[1])); h = relu(conv(h, P[2], P[3])); return conv(h, P[4], P[5])
 def fwd_unet(P, x):
@@ -87,9 +90,9 @@ def train(unet, levels, Ytr, seed, cap):
         frac = max(s / MAX_STEPS, (time.time() - t0) / cap)
         if frac >= 1: break
         lr = float(3e-3 * 0.5 * (1 + np.cos(np.pi * frac)))
-        Yb = np.empty((B, Tw, 16, 16), np.uint8)
+        Yb = np.empty((B, Tw, 16, 16), np.uint8); lvb = []
         for i in range(B):
-            lv = levels[rng.integers(len(levels))]; v = rng.integers(len(Ytr[lv]))
+            lv = levels[rng.integers(len(levels))]; v = rng.integers(len(Ytr[lv])); lvb.append(lv)
             t, y, x = rng.integers(0, T_LEN - Tw + 1), rng.integers(0, 17), rng.integers(0, 17)
             Yb[i] = Ytr[lv][v, t:t + Tw, y:y + 16, x:x + 16]
         if rng.random() < .5: Yb = Yb[:, :, ::-1]
@@ -97,6 +100,9 @@ def train(unet, levels, Ytr, seed, cap):
         if rng.random() < .5: Yb = Yb[:, ::-1]
         mask = rng.random(Yb.shape) < 1 / K
         x = np.stack([Yb * (~mask), mask], 1).astype(np.float32)
+        if unet:
+            lc = np.array([lvc(l) for l in lvb], np.float32).reshape(B, 1, 1, 1, 1)
+            x = np.concatenate([x, np.broadcast_to(lc, (B, 1, Tw, 16, 16))], 1).astype(np.float32)
         out = fwd(P, Nd(x)); p = sig(out.v[:, 0])
         run.append(float(-(Yb * np.log(p + 1e-7) + (1 - Yb) * np.log(1 - p + 1e-7))[mask].mean()))
         backward(out, ((p - Yb) * mask / max(mask.sum(), 1))[:, None].astype(np.float32))
@@ -107,7 +113,7 @@ def train(unet, levels, Ytr, seed, cap):
     say(f"trained {'unet' if unet else 'base'} seed={seed}: {s} steps, masked NLL (last 50) {np.mean(run[-50:]):.4f}")
     return P
 
-def predict(P, unet, Y, seed):
+def predict(P, unet, Y, seed, lv=None):
     """Leave-bits-out logits: each bit is predicted while masked (K folds), never from itself."""
     global TRACK
     TRACK = False
@@ -117,6 +123,8 @@ def predict(P, unet, Y, seed):
     for k in range(K):
         m = fold == k
         x = np.stack([Y * (~m), m], 1).astype(np.float32)
+        if unet:
+            x = np.concatenate([x, np.full((x.shape[0], 1) + x.shape[2:], lvc(lv), np.float32)], 1)
         for i in range(0, len(Y), 4):
             for t in range(0, T_LEN, Tw):
                 lg = fwd(P, Nd(x[i:i + 4, :, t:t + Tw])).v[:, 0]
@@ -167,10 +175,10 @@ def main():
         P = train(False, [lv], Y["tr"], j, BASE_CAP)
         LB[lv] = {sp: predict(P, False, Y[sp][lv], 1 if sp == "va" else 2) for sp in ("va", "te")}
     say("baseline done")
-    for m in range(NM):  # improved: U-Net ensemble trained on mixed light levels
+    for m in range(NM):  # improved: light-level-conditioned U-Net ensemble trained on mixed light levels
         P = train(True, LEVELS, Y["tr"], 100 + m, ENS_CAP)
         for lv in LEVELS:
-            LM[m][lv] = {sp: predict(P, True, Y[sp][lv], 1 if sp == "va" else 2) for sp in ("va", "te")}
+            LM[m][lv] = {sp: predict(P, True, Y[sp][lv], 1 if sp == "va" else 2, lv) for sp in ("va", "te")}
         say(f"member {m} predicted")
 
     S, M, PV, bars = {}, {}, {}, {}
@@ -222,14 +230,14 @@ def main():
     plt.legend(); plt.tight_layout(); plt.savefig("figures/psnr.png", dpi=100)
 
     res = {"question": "Can a small self-supervised 3D-CNN ensemble with per-pixel uncertainty beat a single bit2bit-style photon predictor in PSNR and calibration on simulated quanta videos of moving digits?",
-           "method": "Self-supervised masked-bit prediction (Bernoulli NLL) with 3D CNNs on simulated SPAD videos of moving MNIST digits at 3 light levels; leave-bits-out predictions; baseline vs U-Net ensemble + temperature scaling.",
+           "method": "Self-supervised masked-bit prediction (Bernoulli NLL) with 3D CNNs on simulated SPAD videos of moving MNIST digits at 3 light levels; leave-bits-out predictions; baseline vs light-level-conditioned U-Net ensemble + temperature scaling.",
            "dataset": {"name": "Simulated moving-MNIST binary quanta videos", "source_url": URL, "n_rows": NTR + NVA + NTE,
                        "n_train": NTR, "n_test": NTE, "same_as_paper": False},
            "metric_name": "PSNR (dB) vs clean intensity, mean over 3 light levels", "higher_is_better": True,
            "baseline": "bit2bit-style small 3-layer 3D CNN (8-frame window), masked-bit Bernoulli loss, one model per light level, no calibration.",
-           "improved": "U-Net-like 3D CNN with 16-frame window trained on mixed light levels, ensemble of members, temperature scaling of the rate on validation bits; spread gives uncertainty.",
+           "improved": "U-Net-like 3D CNN with 16-frame window trained on mixed light levels and conditioned on the known light level (extra constant input channel), ensemble of members, temperature scaling of the rate on validation bits; spread gives uncertainty.",
            "metrics": M,
-           "notes": "Stand-in simulation (paper data/architecture unknown); numpy-only CNNs with wall-clock-capped training so step counts depend on hardware. Improved model gets more total training compute than the baseline. Motion wraps around the frame; no dark counts; light level = mean flux per pixel-frame. Held-out-bit NLL/ECE use leave-bits-out predictions (K folds) on test bits. Uncertainty is epistemic ensemble spread of reconstructed intensity; cov90_raw uses +-1.645*sd, cov90_cal rescales width (sd+0.05) using a validation quantile. Reference window/sigma chosen on validation. Few test videos (small sample)."}
+           "notes": "Stand-in simulation (paper data/architecture unknown); numpy-only CNNs with wall-clock-capped training so step counts depend on hardware. Improved model gets more total training compute than the baseline and is told the (known) light level via an input channel. Motion wraps around the frame; no dark counts; light level = mean flux per pixel-frame. Held-out-bit NLL/ECE use leave-bits-out predictions (K folds) on test bits. Uncertainty is epistemic ensemble spread of reconstructed intensity; cov90_raw uses +-1.645*sd, cov90_cal rescales width (sd+0.05) using a validation quantile. Reference window/sigma and temperature chosen on validation videos only (never test). Few test videos (small sample)."}
     with open("results.json", "w", encoding="utf-8") as f: json.dump(res, f, indent=2)
     say("done", {k: round(M[k], 4) for k in ("baseline_score", "improved_score", "improvement")})
 
